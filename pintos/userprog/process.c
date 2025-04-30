@@ -56,13 +56,43 @@ process_execute (const char *file_name)
     return TID_ERROR;
   }
 
+  /* Semaphore: Wait for child process to finish loading. */
+  sema_down(&thread_current()->sema_wait);
+  if(!thread_current()->child_loaded) return TID_ERROR;
+
   return tid;
 }
 
 // lab01 Hint - This is the mainly function you have to trace.
 static void push_argument(void **esp, char *cmdline)
 {
+  int argc = 0;
+  char *argv[50], *token, *save_ptr;
 
+  for(token = strtok_r(cmdline," ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)){
+    *esp -= (strlen(token) + 1);
+    memcpy(*esp, token, strlen(token) + 1);
+    argv[argc++] = (char*) *esp;
+  }
+  argv[argc] = NULL;
+
+  *esp = (void *)((uintptr_t)(*esp) & 0xfffffffc);
+
+  for(int i = argc; i >= 0; i--)
+  {
+    *esp -= sizeof(char *);
+    *(char **)(*esp) = argv[i];
+  }
+
+  char **argv_base = (char **)(*esp);
+  *esp -= sizeof(char **);
+  *(char ***)(*esp) = argv_base;
+
+  *esp -= sizeof(int);
+  *(int *)(*esp) = argc;
+
+  *esp -= sizeof(void *);
+  *(void **)(*esp) = NULL;
 }
 
 /* A thread function that loads a user process and starts it
@@ -88,10 +118,17 @@ static void start_process (void *file_name_)
   success = load (file_name, &if_.eip, &if_.esp);
   if(success)
   {
+    
     push_argument (&if_.esp, fn_copy);
+
+    thread_current()->parent->child_loaded = true;
+    sema_up(&thread_current()->parent->sema_wait);
+    
   }else
   {
     /* If load failed, quit. */
+    thread_current()->parent->child_loaded = false;
+    sema_up(&thread_current()->parent->sema_wait);
     thread_exit ();
   }
 
@@ -108,7 +145,6 @@ static void start_process (void *file_name_)
 }
 
 
-
 /* Waits for thread TID to die and returns its exit status.  If
    it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If TID is invalid or if it was not a
@@ -118,10 +154,37 @@ static void start_process (void *file_name_)
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-   int
-   process_wait (tid_t child_tid UNUSED) 
+   static struct child *find_child(struct thread *parent, tid_t child_tid)
    {
-     return -1;
+     struct list_elem *e;
+     for(e = list_begin(&parent->children); e != list_end(&parent->children); e = list_next(e)){
+       struct child *c = list_entry(e, struct child, elem);
+       if(c->tid == child_tid) return c;
+     }
+     return NULL;
+   }
+   
+   int process_wait (tid_t child_tid UNUSED) 
+   {
+     struct child *c = find_child(thread_current(), child_tid);
+   
+     if(!c){
+       // printf("[DEBUG] Parent %d cannot find child %d\n", thread_current()->tid, child_tid);
+       return -1;
+     } 
+     if(c->succ){
+       // printf("[DEBUG] Parent %d already waited for child %d\n", thread_current()->tid, child_tid);
+       return -1;
+     } 
+   
+     c->succ = true;
+     sema_down(&c->sema_wait);
+   
+     int status = c->st_exit;
+     list_remove(&c->elem);
+     free(c);
+   
+     return status;
    }
 
 /* Free the current process's resources. */
@@ -255,12 +318,16 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
+  acquire_file_lock();
   file = filesys_open (file_name);
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+    /* Deny write for the opened file by calling file deny write */
+    file_deny_write(file);
+  t->exec_file = file;
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -346,7 +413,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  release_file_lock();
   return success;
 }
 

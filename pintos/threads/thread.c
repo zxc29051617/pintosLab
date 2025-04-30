@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <random.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+#include <filesys/file.h>
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -11,6 +13,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -36,6 +39,9 @@ static struct thread *initial_thread;
 
 /* Lock used by allocate_tid(). */
 static struct lock tid_lock;
+
+/* Lock used by file operations. */
+static struct lock file_lock;
 
 /* Stack frame for kernel_thread(). */
 struct kernel_thread_frame 
@@ -71,6 +77,9 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+void acquire_file_lock(void){lock_acquire(&file_lock);}
+void release_file_lock(void){lock_release(&file_lock);}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -89,6 +98,7 @@ thread_init (void)
 {
   ASSERT (intr_get_level () == INTR_OFF);
 
+  lock_init (&file_lock);
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
@@ -182,6 +192,16 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+  
+#ifdef USERPROG
+  // Teresa
+  t->child_info = malloc(sizeof(struct child));
+  t->child_info->tid = tid;
+  sema_init (&t->child_info->sema_wait, 0);
+  list_push_back (&thread_current()->children, &t->child_info->elem);
+  t->child_info->st_exit = UINT32_MAX;
+  t->child_info->succ = false;
+#endif
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -285,11 +305,38 @@ thread_exit (void)
 #ifdef USERPROG
   process_exit ();
 #endif
+  intr_disable ();
+#ifdef USERPROG
+
+printf ("%s: exit(%d)\n",thread_name(), thread_current()->st_exit);
+thread_current ()->child_info->st_exit = thread_current()->st_exit;
+sema_up (&thread_current()->child_info->sema_wait);
+
+  /* Close the executing file in this thread. */
+  if(thread_current()->exec_file != NULL)
+  {
+    file_allow_write(thread_current()->exec_file);
+    file_close(thread_current()->exec_file);
+    thread_current()->exec_file = NULL;
+  }
+  
+
+  /* Close all opened files*/
+  struct list *files = &thread_current()->files;
+  while(!list_empty(files)){
+    struct list_elem *e = list_pop_front(files);
+    struct open_file *f = list_entry(e, struct open_file, elem);
+    acquire_file_lock();
+    file_close(f->file);
+    release_file_lock();
+    free(f);
+  }
+  
+#endif
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
-  intr_disable ();
   list_remove (&thread_current()->allelem);
   thread_current ()->status = THREAD_DYING;
   schedule ();
@@ -464,6 +511,19 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
 
+  #ifdef USERPROG
+  /* Thread initialization */
+  if(t == initial_thread) t->parent = NULL;
+  else t->parent = thread_current();
+  list_init(&t->children);
+  sema_init(&t->sema_wait, 0);
+  t->st_exit = UINT32_MAX;
+  t->child_loaded = true;
+
+  t->exec_file = NULL;
+  t->file_fd = 2; // fd 0 (STDIN_FILENO) is standard input, fd 1 (STDOUT_FILENO) is standard output. 
+  list_init(&t->files);
+#endif 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
