@@ -5,6 +5,10 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
+#include "threads/vaddr.h"
+#include "vm/page.h"
+#define MAX_STACK (1 << 23) // 8MB stack limit
+
 /* Number of page faults processed. */
 static long long page_fault_cnt;
 
@@ -122,40 +126,57 @@ kill (struct intr_frame *f)
 static void
 page_fault (struct intr_frame *f) 
 {
-  bool not_present;  /* True: not-present page, false: writing r/o page. */
-  bool write;        /* True: access was write, false: access was read. */
-  bool user;         /* True: access by user, false: access by kernel. */
-  void *fault_addr;  /* Fault address. */
+    /* 1. 取出 fault address ------------------------------------------------ */
+    void *fault_addr;
+    asm ("movl %%cr2, %0" : "=r"(fault_addr));
 
-  /* Obtain faulting address, the virtual address that was
-     accessed to cause the fault.  It may point to code or to
-     data.  It is not necessarily the address of the instruction
-     that caused the fault (that's f->eip).
-     See [IA32-v2a] "MOV--Move to/from Control Registers" and
-     [IA32-v3a] 5.15 "Interrupt 14--Page Fault Exception
-     (#PF)". */
-  asm ("movl %%cr2, %0" : "=r" (fault_addr));
+    intr_enable ();            /* 重新開中斷 */
+    page_fault_cnt++;
 
-  /* Turn interrupts back on (they were only off so that we could
-     be assured of reading CR2 before it changed). */
-  intr_enable ();
+    /* 2. 解碼 error_code --------------------------------------------------- */
+    bool not_present = (f->error_code & PF_P) == 0;
+    bool write       = (f->error_code & PF_W) != 0;
+    bool user        = (f->error_code & PF_U) != 0;
+   /* ----------  Lazy-load (file / anon) 或 mmap 頁  ---------- */
+   void *upage = pg_round_down (fault_addr);
+   struct page *page = spt_find_page (&thread_current ()->spt, upage);
 
-  /* Count page faults. */
-  page_fault_cnt++;
+   if (not_present && page != NULL) {
+    /* 這個 upage 本來就登記在 SPT，代表它要嘛還沒 load 進來，
+       要嘛被 swap out；把它 claim 回來就能解決 page fault。 */
+    if (vm_do_claim_page (page))
+        return;                 /* 處理成功，直接結束 handler */
+    /* claim 失敗就往下掉到 stack-growth 判斷／最後 kill() */
+   }
+    /* 3. ★ 嘗試做 Stack Growth ★ ------------------------------------------ */
+    if (not_present && user) {
+        void *esp   = f->esp;                 /* user-mode ESP */
+        void *upage = pg_round_down (fault_addr);
 
-  /* Determine cause. */
-  not_present = (f->error_code & PF_P) == 0;
-  write = (f->error_code & PF_W) != 0;
-  user = (f->error_code & PF_U) != 0;
+        bool within_esp = fault_addr >= esp - 32;          /* 距離 esp ≤32B */
+        bool below_phys = fault_addr < PHYS_BASE;          /* 仍在 user space */
+        bool under_cap  = PHYS_BASE - upage <= MAX_STACK;  /* 沒超 8 MB */
+        bool above_code = fault_addr >= (void *) 0x08048000;   /* ELF code 起始 */
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+        if (within_esp && below_phys && under_cap && above_code) {
+            /* (1) 加一條 VM_STACK 條目到 SPT ------------------------------ */
+            if (vm_alloc_page (VM_STACK, upage, /*writable=*/true)) {
+                /* (2) 立刻 claim → 配 frame、裝到 pagedir -------------- */
+                struct suppPage *sp = spt_find_page (&thread_current()->spt,
+                                                     upage);
+                if (sp && vm_do_claim_page (sp))
+                    return;                   /* page fault 已解決，直接回去 */
+            }
+            /* 如果 alloc/claim 失敗就往下掉到 kill() */
+        }
+    }
+
+    /* 4. 其他情況：照舊把行程殺掉 --------------------------------------- */
+    printf ("Page fault at %p: %s error %s page in %s context.\n",
+            fault_addr,
+            not_present ? "not present" : "rights violation",
+            write ? "writing" : "reading",
+            user ? "user" : "kernel");
+    kill (f);                                 /* ← 千萬別忘記這行 */
 }
 

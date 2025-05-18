@@ -14,6 +14,7 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "threads/malloc.h"
+#include "vm/page.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -332,6 +333,7 @@ sema_up (&thread_current()->child_info->sema_wait);
     free(f);
   }
   
+  supplemental_page_table_destroy(&thread_current()->spt);  // ← ← ← 加這行
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
@@ -523,6 +525,8 @@ init_thread (struct thread *t, const char *name, int priority)
   t->exec_file = NULL;
   t->file_fd = 2; // fd 0 (STDIN_FILENO) is standard input, fd 1 (STDOUT_FILENO) is standard output. 
   list_init(&t->files);
+
+  supplemental_page_table_init(&t->spt);  // ← ← ← 加這行
 #endif 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

@@ -16,7 +16,24 @@
 #include <threads/vaddr.h>
 #include <filesys/filesys.h>
 
+#include "vm/page.h"
+
 #define MAX_SYSCALL 20
+
+
+// -----------  pin/unpin buffer -------------
+static void vm_pin_buffer(const void *buf, size_t size) {
+    uint8_t *start = (uint8_t *)pg_round_down(buf);
+    uint8_t *end = (uint8_t *)pg_round_down((const uint8_t *)buf + size - 1);
+    for (uint8_t *p = start; p <= end; p += PGSIZE)
+        vm_pin_page(p);
+}
+static void vm_unpin_buffer(const void *buf, size_t size) {
+    uint8_t *start = (uint8_t *)pg_round_down(buf);
+    uint8_t *end = (uint8_t *)pg_round_down((const uint8_t *)buf + size - 1);
+    for (uint8_t *p = start; p <= end; p += PGSIZE)
+        vm_unpin_page(p);
+}
 
 // lab01 Hint - Here are the system calls you need to implement.
 
@@ -133,19 +150,24 @@ void sys_write(struct intr_frame* f)
   check_ptr(buffer);
   check_ptr(buffer + size - 1);
 
+  // 1. 先 pin buffer
+  vm_pin_buffer(buffer, size);
+
   if(fd == 1){  // STDOUT
     putbuf(buffer, size);
     f->eax = size;
-  }else{
-    struct open_file *tmp = find_file(fd);
-    if(tmp){
-      acquire_file_lock();
-      f->eax = file_write(tmp->file, buffer, size);
-      release_file_lock();
-    }else{
-      f->eax = 0;
+  } else {
+      struct open_file *tmp = find_file(fd);
+      if(tmp){
+          acquire_file_lock();
+          f->eax = file_write(tmp->file, buffer, size);
+          release_file_lock();
+      } else {
+            f->eax = 0;
+        }
     }
-  }
+    // 2. 用完 unpin buffer
+    vm_unpin_buffer(buffer, size);
 }
 
 void sys_create(struct intr_frame* f)
@@ -211,33 +233,35 @@ void sys_filesize (struct intr_frame* f){
 
 void sys_read (struct intr_frame* f)
 {
-  uint32_t *args = (uint32_t)f->esp;
+    uint32_t *args = (uint32_t)f->esp;
 
-  int fd = args[1];
-  uint8_t  *buffer = (uint8_t *)args[2];
-  off_t size = (off_t)args[3];
+    int fd = args[1];
+    uint8_t  *buffer = (uint8_t *)args[2];
+    off_t size = (off_t)args[3];
 
-  check_ptr(buffer);
-  check_ptr(buffer + size);
+    check_ptr(buffer);
+    check_ptr(buffer + size);
 
-  if(fd == 0)
-  {
-    for(int i = 0; i < size; i++)
-      buffer[i] = input_getc();
-    f->eax = size;
-  }else
-  {
-    struct open_file *tmp = find_file(fd);
-    if(tmp)
+    // 1. 先 pin buffer
+    vm_pin_buffer(buffer, size);
+
+    if(fd == 0)
     {
-      acquire_file_lock();
-      f->eax = file_read(tmp->file, buffer, size);
-      release_file_lock(); 
-    }else
-    {
-      f->eax = -1;
+        for(int i = 0; i < size; i++)
+            buffer[i] = input_getc();
+        f->eax = size;
+    } else {
+        struct open_file *tmp = find_file(fd);
+        if(tmp) {
+            acquire_file_lock();
+            f->eax = file_read(tmp->file, buffer, size);
+            release_file_lock(); 
+        } else {
+            f->eax = -1;
+        }
     }
-  }
+    // 2. 用完 unpin buffer
+    vm_unpin_buffer(buffer, size);
 }
 
 void sys_seek(struct intr_frame* f)
