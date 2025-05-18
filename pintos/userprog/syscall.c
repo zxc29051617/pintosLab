@@ -16,24 +16,7 @@
 #include <threads/vaddr.h>
 #include <filesys/filesys.h>
 
-#include "vm/page.h"
-
 #define MAX_SYSCALL 20
-
-
-// -----------  pin/unpin buffer -------------
-static void vm_pin_buffer(const void *buf, size_t size) {
-    uint8_t *start = (uint8_t *)pg_round_down(buf);
-    uint8_t *end = (uint8_t *)pg_round_down((const uint8_t *)buf + size - 1);
-    for (uint8_t *p = start; p <= end; p += PGSIZE)
-        vm_pin_page(p);
-}
-static void vm_unpin_buffer(const void *buf, size_t size) {
-    uint8_t *start = (uint8_t *)pg_round_down(buf);
-    uint8_t *end = (uint8_t *)pg_round_down((const uint8_t *)buf + size - 1);
-    for (uint8_t *p = start; p <= end; p += PGSIZE)
-        vm_unpin_page(p);
-}
 
 // lab01 Hint - Here are the system calls you need to implement.
 
@@ -93,14 +76,12 @@ static int get_user (const uint8_t *uaddr)
 
 static void *check_ptr(const void *vaddr)
 {
-  if (vaddr == NULL || !is_user_vaddr(vaddr))
-  invalid_access();
-
-  for (size_t i = 0; i < sizeof(int); i++) {
-    const void *addr = (uint8_t *)vaddr + i;
-    if (!is_user_vaddr(addr) || !pagedir_get_page(thread_current()->pagedir, addr) || get_user(addr) == -1)
+    if (vaddr == NULL || !is_user_vaddr(vaddr))
         invalid_access();
-  }
+    // 最少要檢查 *vaddr 指向的這一頁已存在
+    if (!pagedir_get_page(thread_current()->pagedir, vaddr))
+        invalid_access();
+    return (void *)vaddr;
 }
 
 static struct open_file *find_file(int fd)
@@ -115,203 +96,210 @@ static struct open_file *find_file(int fd)
   return NULL;
 }
 
-void sys_exit(struct intr_frame* f)
-{
-  int *status_ptr = (int *)f->esp + 1;
-  check_ptr(status_ptr);
-  thread_current()->st_exit = *status_ptr;
-  thread_exit();
+static void get_args(struct intr_frame *f, int *args, int n) {
+    uint32_t *esp = (uint32_t *) f->esp;
+    for (int i = 0; i < n; ++i) {
+        check_ptr(&esp[i + 1]);
+        args[i] = esp[i + 1];
+    }
 }
 
-void sys_exec(struct intr_frame* f)
-{
-  char **cmd_ptr = (char **)f->esp + 1;
-  check_ptr(cmd_ptr);
-  check_ptr(*cmd_ptr);
-  f->eax = process_execute(*cmd_ptr); // return valid pid or -1
+
+void sys_exit(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);  // 安全地取得 exit status
+    int status = args[0];
+    thread_current()->st_exit = status;
+    thread_exit();
 }
 
-void sys_wait(struct intr_frame* f)
-{
-  uint32_t *args = f->esp;
-  check_ptr(args + 1);
-  int pid = args[1];
-  f->eax = process_wait(pid);
+void sys_exec(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
+    check_ptr((const void *)args[0]);  // 檢查 pointer 是否有效
+    f->eax = process_execute((const char *)args[0]);
 }
 
-void sys_write(struct intr_frame* f)
-{
-  uint32_t *args = (uint32_t)f->esp;
+void sys_wait(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);  // 只需一個參數（pid）
+    f->eax = process_wait(args[0]);
+}
 
-  int fd = args[1];
-  const char *buffer = (const char *)args[2];
-  off_t size = (off_t)args[3];
+void sys_write(struct intr_frame *f) {
+    int args[3];
+    get_args(f, args, 3);  // 取得 fd, buffer, size
+    int fd = args[0];
+    const char *buffer = (const char *)args[1];
+    unsigned size = (unsigned)args[2];
 
-  check_ptr(buffer);
-  check_ptr(buffer + size - 1);
+    check_ptr(buffer);
+    if (size > 0)
+        check_ptr(buffer + size - 1);  // 檢查整個 buffer 是否 user space
 
-  // 1. 先 pin buffer
-  vm_pin_buffer(buffer, size);
+#ifdef VM
+    vm_pin_buffer(buffer, size); // 若有 pin 機制則加上
+#endif
 
-  if(fd == 1){  // STDOUT
-    putbuf(buffer, size);
-    f->eax = size;
-  } else {
-      struct open_file *tmp = find_file(fd);
-      if(tmp){
-          acquire_file_lock();
-          f->eax = file_write(tmp->file, buffer, size);
-          release_file_lock();
-      } else {
+    if (fd == 1) {  // STDOUT
+        putbuf(buffer, size);
+        f->eax = size;
+    } else {
+        struct open_file *tmp = find_file(fd);
+        if (tmp) {
+            acquire_file_lock();
+            f->eax = file_write(tmp->file, buffer, size);
+            release_file_lock();
+        } else {
             f->eax = 0;
         }
     }
-    // 2. 用完 unpin buffer
+
+#ifdef VM
     vm_unpin_buffer(buffer, size);
+#endif
 }
 
-void sys_create(struct intr_frame* f)
-{
-  uint32_t *args = f->esp;
-  const char *file = (const char *) args[1];
-  unsigned initial_size = (unsigned)args[2];
-  check_ptr (file);
+void sys_create(struct intr_frame *f) {
+    int args[2];
+    get_args(f, args, 2);  // 取出 file (pointer), initial_size
+    const char *file = (const char *)args[0];
+    unsigned initial_size = (unsigned)args[1];
+    check_ptr(file);
 
-  acquire_file_lock ();
-  f->eax = filesys_create (file, initial_size);
-  release_file_lock ();
+    acquire_file_lock();
+    f->eax = filesys_create(file, initial_size);
+    release_file_lock();
 }
 
-void sys_remove(struct intr_frame* f)
-{
-  char **file_ptr = (char **)f->esp + 1;
-  check_ptr(file_ptr);
-  check_ptr(*file_ptr);
-  acquire_file_lock ();
-  f->eax = filesys_remove (*file_ptr);
-  release_file_lock ();
+void sys_remove(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
+    const char *file = (const char *)args[0];
+    check_ptr(file);
+
+    acquire_file_lock();
+    f->eax = filesys_remove(file);
+    release_file_lock();
 }
 
-void sys_open(struct intr_frame* f)
-{
-  char **file_ptr = (char **)f->esp + 1;
-  check_ptr(file_ptr);
-  check_ptr(*file_ptr);
-  acquire_file_lock ();
-  struct file *opened = filesys_open(*file_ptr);
-  release_file_lock ();
-  if(opened)
-  {
-    struct thread *t = thread_current();
-    struct open_file *tmp = malloc(sizeof(struct open_file));
-    tmp->fd = t->file_fd++;
-    tmp->file = opened;
-    list_push_back(&t->files, &tmp->elem);
-    f->eax = tmp->fd;
-  }else
-  {
-    f->eax = -1;
-  }
+void sys_open(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
+    const char *file = (const char *)args[0];
+    check_ptr(file);
+
+    acquire_file_lock();
+    struct file *opened = filesys_open(file);
+    release_file_lock();
+
+    if (opened) {
+        struct thread *t = thread_current();
+        struct open_file *tmp = malloc(sizeof(struct open_file));
+        tmp->fd = t->file_fd++;
+        tmp->file = opened;
+        list_push_back(&t->files, &tmp->elem);
+        f->eax = tmp->fd;
+    } else {
+        f->eax = -1;
+    }
 }
 
-void sys_filesize (struct intr_frame* f){
+void sys_filesize(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
+    int fd = args[0];
 
-  uint32_t *args = (uint32_t)f->esp;
-  int fd = args[1];
-  struct open_file * tmp = find_file(fd);
-  if (tmp)
-  {
-    acquire_file_lock ();
-    f->eax = file_length (tmp->file);
-    release_file_lock ();
-  } 
-  else
-  {
-    f->eax = -1;
-  }
+    struct open_file *tmp = find_file(fd);
+    if (tmp) {
+        acquire_file_lock();
+        f->eax = file_length(tmp->file);
+        release_file_lock();
+    } else {
+        f->eax = -1;
+    }
 }
 
-void sys_read (struct intr_frame* f)
-{
-    uint32_t *args = (uint32_t)f->esp;
+void sys_read(struct intr_frame *f) {
+    int args[3];
+    get_args(f, args, 3);
 
-    int fd = args[1];
-    uint8_t  *buffer = (uint8_t *)args[2];
-    off_t size = (off_t)args[3];
+    int fd = args[0];
+    uint8_t *buffer = (uint8_t *)args[1];
+    off_t size = (off_t)args[2];
 
+    // 要檢查 buffer 開頭 & 結尾
     check_ptr(buffer);
-    check_ptr(buffer + size);
+    check_ptr(buffer + size - 1);
 
-    // 1. 先 pin buffer
+    // 1. pin buffer 以避免被 evict
     vm_pin_buffer(buffer, size);
 
-    if(fd == 0)
-    {
-        for(int i = 0; i < size; i++)
+    if (fd == 0) {
+        for (int i = 0; i < size; i++)
             buffer[i] = input_getc();
         f->eax = size;
     } else {
         struct open_file *tmp = find_file(fd);
-        if(tmp) {
+        if (tmp) {
             acquire_file_lock();
             f->eax = file_read(tmp->file, buffer, size);
-            release_file_lock(); 
+            release_file_lock();
         } else {
             f->eax = -1;
         }
     }
-    // 2. 用完 unpin buffer
+
+    // 2. 用完要 unpin
     vm_unpin_buffer(buffer, size);
 }
 
-void sys_seek(struct intr_frame* f)
-{
-  uint32_t *args = f->esp;
 
-  int fd = args[1];
-  unsigned position = args[2];
-  struct open_file *tmp = find_file(fd);
-  if (tmp)
-  {
-    acquire_file_lock ();
-    file_seek (tmp->file, position);
-    release_file_lock();
-  }
+void sys_seek(struct intr_frame *f) {
+    int args[2];
+    get_args(f, args, 2);
+
+    int fd = args[0];
+    unsigned position = (unsigned)args[1];
+
+    struct open_file *tmp = find_file(fd);
+    if (tmp) {
+        acquire_file_lock();
+        file_seek(tmp->file, position);
+        release_file_lock();
+    }
 }
 
-void sys_tell (struct intr_frame* f)
-{
-  uint32_t *args = f->esp;
-  check_ptr(args + 1);
+void sys_tell(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
 
-  int fd = args[1];
-  struct open_file *tmp = find_file(fd);
-  if (tmp)
-  {
-    acquire_file_lock ();
-    f->eax = file_tell (tmp->file);
-    release_file_lock ();
-  }else{
-    f->eax = -1;
-  }
+    int fd = args[0];
+    struct open_file *tmp = find_file(fd);
+    if (tmp) {
+        acquire_file_lock();
+        f->eax = file_tell(tmp->file);
+        release_file_lock();
+    } else {
+        f->eax = -1;
+    }
 }
 
-void sys_close (struct intr_frame* f)
-{
-  uint32_t *args = (uint32_t)f->esp;
-  int fd = args[1];
-  struct open_file *tmp = find_file (fd);
-  if (tmp)
-  {
-    acquire_file_lock ();
-    file_close (tmp->file);
-    release_file_lock ();
+void sys_close(struct intr_frame *f) {
+    int args[1];
+    get_args(f, args, 1);
 
-    list_remove (&tmp->elem);
-    free (tmp);
-  }
+    int fd = args[0];
+    struct open_file *tmp = find_file(fd);
+    if (tmp) {
+        acquire_file_lock();
+        file_close(tmp->file);
+        release_file_lock();
+
+        list_remove(&tmp->elem);
+        free(tmp);
+    }
 }
-
 
 
 
@@ -331,14 +319,13 @@ void invalid_access (void)
   thread_exit ();
 }
 
-static void syscall_handler (struct intr_frame *f UNUSED) 
+static void syscall_handler (struct intr_frame *f) 
 {
-  check_ptr((int *)f->esp + 1);
+    check_ptr(f->esp);
 
-  int sys_code = *(int *)f->esp;
-  if (sys_code < 0 || sys_code >= MAX_SYSCALL)
-    invalid_access();
+    int sys_code = *(int *)f->esp;
+    if (sys_code < 0 || sys_code >= MAX_SYSCALL)
+        invalid_access();
 
-
-  syscalls[sys_code](f);
+    syscalls[sys_code](f);
 }

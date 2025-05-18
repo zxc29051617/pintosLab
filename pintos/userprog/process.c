@@ -28,111 +28,109 @@ static void push_argument(void **esp, char *cmdline);
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute(const char *file_name)
 {
-  char *fn_copy, *fn_copy2;
-  tid_t tid;
+    char *fn_copy;
+    tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-    Otherwise there's a race between the caller and load(). */
-  fn_copy = malloc(strlen(file_name)+1);
-  fn_copy2 = malloc(strlen(file_name)+1);
-  if (fn_copy == NULL)
-    return TID_ERROR;
+    /* Make a copy of FILE_NAME for the child. */
+    fn_copy = malloc(strlen(file_name) + 1);
+    if (fn_copy == NULL)
+        return TID_ERROR;
+    strlcpy(fn_copy, file_name, strlen(file_name) + 1);
 
-  strlcpy (fn_copy, file_name, strlen(file_name)+1);
-  strlcpy (fn_copy2, file_name, strlen(file_name)+1);
+    /* Parse the executable name (for thread_create) */
+    char program_name[16];
+    strlcpy(program_name, file_name, sizeof(program_name));
+    char *save_ptr;
+    strtok_r(program_name, " ", &save_ptr);  // program_name 會只剩 "prog"
 
+    /* Create a new thread to execute FILE_NAME. */
+    tid = thread_create(program_name, PRI_DEFAULT, start_process, fn_copy);
+    if (tid == TID_ERROR) {
+        free(fn_copy);
+        return TID_ERROR;
+    }
 
-  /* Create a new thread to execute FILE_NAME. */
-  char *save_ptr;
-  fn_copy = strtok_r(fn_copy, " ", &save_ptr);
+    /* Semaphore: Wait for child process to finish loading. */
+    sema_down(&thread_current()->sema_wait);
+    if (!thread_current()->child_loaded) return TID_ERROR;
 
-  tid = thread_create(fn_copy, PRI_DEFAULT, start_process, fn_copy2);
-  free(fn_copy);
-
-  if (tid == TID_ERROR){
-    free (fn_copy2); 
-    return TID_ERROR;
-  }
-
-  /* Semaphore: Wait for child process to finish loading. */
-  sema_down(&thread_current()->sema_wait);
-  if(!thread_current()->child_loaded) return TID_ERROR;
-
-  return tid;
+    return tid;
 }
 
 // lab01 Hint - This is the mainly function you have to trace.
 static void push_argument(void **esp, char *cmdline)
 {
-  int argc = 0;
-  char *argv[50], *token, *save_ptr;
+    int argc = 0;
+    char *argv[50], *token, *save_ptr;
 
-  for(token = strtok_r(cmdline," ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)){
-    *esp -= (strlen(token) + 1);
-    memcpy(*esp, token, strlen(token) + 1);
-    argv[argc++] = (char*) *esp;
-  }
-  argv[argc] = NULL;
+    // 1. 先把每個 argument 的字串 copy 到 stack
+    for (token = strtok_r(cmdline, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
+        *esp -= (strlen(token) + 1);
+        memcpy(*esp, token, strlen(token) + 1);
+        argv[argc++] = (char *) *esp;
+    }
+    argv[argc] = NULL;
 
-  *esp = (void *)((uintptr_t)(*esp) & 0xfffffffc);
+    // 2. 對齊 esp 為 4 bytes
+    *esp = (void *) ((uintptr_t)(*esp) & 0xfffffffc);
 
-  for(int i = argc; i >= 0; i--)
-  {
-    *esp -= sizeof(char *);
-    *(char **)(*esp) = argv[i];
-  }
+    // 3. 把 argv[] (即指標陣列) 往 stack push 下去
+    for (int i = argc; i >= 0; i--) {
+        *esp -= sizeof(char *);
+        *(char **)(*esp) = argv[i];
+    }
 
-  char **argv_base = (char **)(*esp);
-  *esp -= sizeof(char **);
-  *(char ***)(*esp) = argv_base;
+    // 4. 再 push argv 的起始位址
+    char **argv_base = (char **)(*esp);
+    *esp -= sizeof(char **);
+    *(char ***)(*esp) = argv_base;
 
-  *esp -= sizeof(int);
-  *(int *)(*esp) = argc;
+    // 5. push argc
+    *esp -= sizeof(int);
+    *(int *)(*esp) = argc;
 
-  *esp -= sizeof(void *);
-  *(void **)(*esp) = NULL;
+    // 6. push fake return address
+    *esp -= sizeof(void *);
+    *(void **)(*esp) = NULL;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process (void *file_name_)
-{
-  char *file_name = file_name_;
-  struct intr_frame if_;
-  bool success;
+static void start_process(void *file_name_) {
+    char *file_name = file_name_;           // file_name_ 是 malloc 出來的整行參數
+    struct intr_frame if_;
+    bool success;
 
-  char *fn_copy = malloc(strlen(file_name) + 1);
-  strlcpy(fn_copy, file_name, strlen(file_name) + 1);
+    // 1. fn_copy 給 push_argument 用
+    char *fn_copy = malloc(strlen(file_name) + 1);
+    strlcpy(fn_copy, file_name, strlen(file_name) + 1);
 
-  /* Initialize interrupt frame and load executable. */
-  memset (&if_, 0, sizeof if_);
-  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
-  if_.cs = SEL_UCSEG;
-  if_.eflags = FLAG_IF | FLAG_MBS;
+    // 2. prog_name 給 load() 用，只拿第一個 token
+    char prog_name[128];
+    strlcpy(prog_name, file_name, sizeof(prog_name));
+    char *save_ptr;
+    strtok_r(prog_name, " ", &save_ptr);   // 只保留第一個 token，後面自動補 \0
 
+    // 3. 初始化 interrupt frame
+    memset(&if_, 0, sizeof if_);
+    if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+    if_.cs = SEL_UCSEG;
+    if_.eflags = FLAG_IF | FLAG_MBS;
 
-  char *save_ptr;
-  file_name = strtok_r(file_name, " ", &save_ptr);
-  success = load (file_name, &if_.eip, &if_.esp);
-  if(success)
-  {
-    
-    push_argument (&if_.esp, fn_copy);
-
-    thread_current()->parent->child_loaded = true;
-    sema_up(&thread_current()->parent->sema_wait);
-    
-  }else
-  {
-    /* If load failed, quit. */
-    thread_current()->parent->child_loaded = false;
-    sema_up(&thread_current()->parent->sema_wait);
-    thread_exit ();
-  }
-
-  free(fn_copy);
+    // 4. load
+    success = load(prog_name, &if_.eip, &if_.esp);
+    if (success) {
+        push_argument(&if_.esp, fn_copy);  // 用完整的參數行
+        thread_current()->parent->child_loaded = true;
+        sema_up(&thread_current()->parent->sema_wait);
+    } else {
+        thread_current()->parent->child_loaded = false;
+        sema_up(&thread_current()->parent->sema_wait);
+        thread_exit();
+    }
+    free(fn_copy);
   
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -140,10 +138,9 @@ static void start_process (void *file_name_)
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
-  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
-  NOT_REACHED ();
+    asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+    NOT_REACHED();
 }
-
 
 /* Waits for thread TID to die and returns its exit status.  If
    it was terminated by the kernel (i.e. killed due to an
@@ -480,69 +477,58 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
 
    Return true if successful, false if a memory allocation error
    or disk read error occurs. */
+
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
 {
-  ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
-  ASSERT (pg_ofs (upage) == 0);
-  ASSERT (ofs % PGSIZE == 0);
+    ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
+    ASSERT (pg_ofs (upage) == 0);
+    ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0) 
-    {
-      /* Calculate how to fill this page.
-         We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
-      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+    while (read_bytes > 0 || zero_bytes > 0) {
+        size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+        size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
+        // 建立 aux
+        struct file_page *aux = malloc(sizeof(struct file_page));
+        if (!aux) return false;
+        // 建議用 file_reopen
+        aux->file = file_reopen(file); // 如果沒有 file_reopen 就直接用 file
+        aux->ofs = ofs;
+        aux->read_bytes = page_read_bytes;
+        aux->zero_bytes = page_zero_bytes;
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+        if (!vm_alloc_page_with_initializer(
+                VM_FILE, upage, writable, lazy_load_segment, aux))
+            return false;
 
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-
-      /* Advance. */
-      read_bytes -= page_read_bytes;
-      zero_bytes -= page_zero_bytes;
-      upage += PGSIZE;
+        read_bytes -= page_read_bytes;
+        zero_bytes -= page_zero_bytes;
+        upage += PGSIZE;
+        ofs += page_read_bytes;
     }
-  return true;
+    return true;
 }
-
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-static bool
-setup_stack (void **esp) 
-{
-  uint8_t *kpage;
-  bool success = false;
+static bool setup_stack(void **esp) {
+    void *stack_bottom = (void *) ((uint8_t *) PHYS_BASE - PGSIZE);
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
-    {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        palloc_free_page (kpage);
-    }
-  return success;
+    // 1. Allocate a suppPage for the stack
+    if (!vm_alloc_page(VM_STACK, stack_bottom, true))
+        return false;
+
+    // 2. Immediately claim (allocate frame and map to upage)
+    struct suppPage *page = spt_find_page(&thread_current()->spt, stack_bottom);
+    if (page == NULL)
+        return false;
+
+    if (!vm_do_claim_page(page))
+        return false;
+
+    *esp = PHYS_BASE;   // Set initial stack pointer
+    return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel

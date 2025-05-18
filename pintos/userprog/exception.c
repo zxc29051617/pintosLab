@@ -139,7 +139,7 @@ page_fault (struct intr_frame *f)
     bool user        = (f->error_code & PF_U) != 0;
    /* ----------  Lazy-load (file / anon) 或 mmap 頁  ---------- */
    void *upage = pg_round_down (fault_addr);
-   struct page *page = spt_find_page (&thread_current ()->spt, upage);
+   struct suppPage *page = spt_find_page(&thread_current()->spt, upage);
 
    if (not_present && page != NULL) {
     /* 這個 upage 本來就登記在 SPT，代表它要嘛還沒 load 進來，
@@ -162,10 +162,9 @@ page_fault (struct intr_frame *f)
             /* (1) 加一條 VM_STACK 條目到 SPT ------------------------------ */
             if (vm_alloc_page (VM_STACK, upage, /*writable=*/true)) {
                 /* (2) 立刻 claim → 配 frame、裝到 pagedir -------------- */
-                struct suppPage *sp = spt_find_page (&thread_current()->spt,
-                                                     upage);
+                struct suppPage *sp = spt_find_page(&thread_current()->spt, upage);
                 if (sp && vm_do_claim_page (sp))
-                    return;                   /* page fault 已解決，直接回去 */
+                  return;                   /* page fault 已解決，直接回去 */
             }
             /* 如果 alloc/claim 失敗就往下掉到 kill() */
         }

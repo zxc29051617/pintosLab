@@ -1,8 +1,11 @@
 #ifndef VM_SWAP_H
 #define VM_SWAP_H
 
+#include "vm/page.h"
+
 #include <stdbool.h>
 #include <stddef.h>
+
 
 /* 一個 swap slot 包含 8 個 sector == 4 KiB */
 #define SECTOR_PER_PAGE 8

@@ -13,6 +13,7 @@
 #include "filesys/file.h"
 
 #include <string.h>
+#include <stdio.h>
 
 /* Hash function for suppPage */
 static unsigned page_hash(const struct hash_elem *e, void *aux UNUSED) {
@@ -98,63 +99,63 @@ void spt_remove_page(struct supplemental_page_table *spt, struct suppPage *page)
 
 /* Claim a page: load it into a physical frame and install into pagedir.
    Return true on success, false on failure. */
+ 
 bool
 vm_do_claim_page (struct suppPage *page)
 {
-    /* ---------- 1. 取得一塊 frame ---------- */
+    printf("[DEBUG] Claim page: va=%p, type=%d, init=%p\n", page->va, page->type, page->initializer);
     struct frame *fr = frame_allocate (PAL_USER | PAL_ZERO);
     if (fr == NULL)
         return false;
 
-    /*  建立 page <-> frame 雙向連結  */
     fr->page   = page;
-    fr->owner  = thread_current ();   /* 若 frame_allocate 已設就可省略 */
-    fr->pinned = true;                /* 先釘住，I/O 完成後才解 */
-    page->frame   = fr;
-    page->pinned  = true;
-
+    fr->owner  = thread_current();
+    fr->pinned = true;
+    page->frame = fr;
+    page->pinned = true;
     void *kva = fr->kva;
 
-    /* ---------- 2. 依 page 類型載入 ---------- */
-    switch (page->type) {
-      case VM_ANON:
-      case VM_STACK:
-        if (page->in_swap) {
-            if (!swap_in (page, kva))
-                goto fail;
-            page->in_swap = false;          /* ← 確定載回後清旗標 */
-        }
-        /* PAL_ZERO 已清好 */
-        break;
-
-      case VM_FILE:
-        if (file_read_at (page->file, kva,
-                          page->read_bytes, page->ofs) != (int) page->read_bytes)
+    // ------- NEW: Lazy loading 支援 -----------
+    if (page->initializer) {
+        // 呼叫 initializer（如 lazy_load_segment）
+        if (!page->initializer(page, page->aux))
             goto fail;
-        memset (kva + page->read_bytes, 0, page->zero_bytes);
-        break;
-
-      default:
-        goto fail;
+        // lazy_load 完成後就可以把這兩個 pointer 清掉
+        page->initializer = NULL;
+        page->aux = NULL;
+    } else {
+        // 舊 eager code
+        switch (page->type) {
+            case VM_ANON:
+            case VM_STACK:
+                if (page->in_swap) {
+                    if (!swap_in (page, kva))
+                        goto fail;
+                    page->in_swap = false;
+                }
+                break;
+            case VM_FILE:
+                if (file_read_at (page->file, kva,
+                                  page->read_bytes, page->ofs) != (int) page->read_bytes)
+                    goto fail;
+                memset (kva + page->read_bytes, 0, page->zero_bytes);
+                break;
+            default:
+                goto fail;
+        }
     }
 
-    /* ---------- 3. 安裝 PTE ---------- */
     struct thread *cur = thread_current ();
     if (!pagedir_set_page (cur->pagedir, page->va, kva, page->writable))
         goto fail;
-
-    /* 讀檔完成後標為乾淨 */
     if (page->type == VM_FILE)
         pagedir_set_dirty (cur->pagedir, page->va, false);
 
-    /* ---------- 4. 解釘 ---------- */
     fr->pinned   = false;
     page->pinned = false;
-
     return true;
 
 fail:
-    /* 若任何步驟失敗，回收 frame，解除雙向指標 */
     fr->pinned = false;
     frame_free (fr);
     page->frame = NULL;
@@ -173,4 +174,86 @@ void vm_unpin_page(void *va) {
     struct suppPage *page = spt_find_page(spt, va);
     if (page && page->frame)
         page->pinned = false;
+}
+
+void vm_pin_buffer(const void *buf, size_t size) {
+    // 對 [buf, buf+size-1] 所跨的所有頁都 pin
+    const uint8_t *start = pg_round_down(buf);
+    const uint8_t *end = pg_round_down((const uint8_t *)buf + size - 1);
+    for (const uint8_t *p = start; p <= end; p += PGSIZE) {
+        vm_pin_page((void *)p);
+    }
+}
+
+void vm_unpin_buffer(const void *buf, size_t size) {
+    // 對 [buf, buf+size-1] 所跨的所有頁都 unpin
+    const uint8_t *start = pg_round_down(buf);
+    const uint8_t *end = pg_round_down((const uint8_t *)buf + size - 1);
+    for (const uint8_t *p = start; p <= end; p += PGSIZE) {
+        vm_unpin_page((void *)p);
+    }
+}
+
+bool
+lazy_load_segment(struct suppPage *page, void *aux)
+{
+    struct file_page *fpage = aux;
+    off_t offset = fpage->ofs;
+    uint32_t read_bytes = fpage->read_bytes;
+    uint32_t zero_bytes = fpage->zero_bytes;
+
+    // 安全檢查
+    if (page->frame == NULL || page->frame->kva == NULL) return false;
+
+    void *kva = page->frame->kva;
+    // 1. 從 file 讀檔進 frame
+    if (file_read_at(fpage->file, kva, read_bytes, offset) != (int)read_bytes) {
+        free(fpage); // <--- 失敗也要 free
+        return false;
+    }
+    // 2. 補 0
+    memset(kva + read_bytes, 0, zero_bytes);
+    free(fpage); // <--- 成功也要 free
+    return true;
+}
+
+
+bool
+vm_alloc_page_with_initializer(enum vm_type type, void *upage, bool writable,
+                              vm_initializer init, void *aux)
+{
+    struct supplemental_page_table *spt = &thread_current()->spt;
+    upage = pg_round_down(upage);
+
+    // 查重
+    if (spt_find_page(spt, upage) != NULL)
+        return false;
+
+    struct suppPage *page = malloc(sizeof(struct suppPage));
+    if (page == NULL)
+        return false;
+
+    page->va = upage;
+    page->writable = writable;
+    page->frame = NULL;
+    page->type = type;
+    page->pinned = false;
+    page->in_swap   = false;
+    page->swap_slot = (size_t)-1;
+
+    // lazy loading 重要欄位
+    page->initializer = init;
+    page->aux = aux;
+
+    // VM_FILE info 可由 lazy_load 裡 aux 補充，也可以預設 NULL
+    page->file = NULL;
+    page->ofs = 0;
+    page->read_bytes = 0;
+    page->zero_bytes = 0;
+
+    if (!spt_insert_page(spt, page)) {
+        free(page);
+        return false;
+    }
+    return true;
 }

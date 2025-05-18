@@ -4,8 +4,22 @@
 #include "lib/kernel/hash.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include "filesys/off_t.h"
 
-#include "filesys/off_t.h" 
+/* ---------- 前置宣告 ---------- */
+struct suppPage;
+struct frame;
+struct file;
+
+// --- Lazy loading 用 typedef/struct ---
+typedef bool (*vm_initializer)(struct suppPage *, void *aux);
+
+struct file_page {
+    struct file *file;
+    off_t ofs;
+    size_t read_bytes;
+    size_t zero_bytes;
+};
 
 /* ---------- 頁面型別 ---------- */
 enum vm_type {
@@ -14,9 +28,6 @@ enum vm_type {
     VM_STACK
 };
 
-/* ---------- 前置宣告，避免互相 include ---------- */
-struct frame;
-
 /* ---------- Supplemental Page Table ---------- */
 struct supplemental_page_table {
     struct hash spt_hash;
@@ -24,29 +35,25 @@ struct supplemental_page_table {
 
 /* ---------- 單一頁的描述子 ---------- */
 struct suppPage {
-    /* ---- ❶ KEY (必須有) ---- */
-    void *va;                       /* page-aligned user virtual address */
-    struct hash_elem hash_elem;     /* entry for supplemental page table */
-
-    /* ---- ❷ 基本屬性 ---- */
+    void *va;                       
+    struct hash_elem hash_elem;
     enum vm_type type;
     bool  writable;
-
-    /* ---- ❸ 與 frame 的連結 ---- */
-    struct frame *frame;            /* NULL ⇒ page currently swapped-out */
-
-    /* ---- ❹ Swap info ---- */
+    struct frame *frame;            
     bool   in_swap;
     size_t swap_slot;
 
-    /* ---- ❺ File-backed info (VM_FILE) ---- */
+    // File-backed info (VM_FILE)
     struct file *file;
     off_t  ofs;
     size_t read_bytes;
     size_t zero_bytes;
 
-    /* ---- ❻ 其他 ---- */
     bool pinned;
+
+    // --- Lazy Loading 欄位 ---
+    vm_initializer initializer;  // 如果非 NULL 就 lazy load
+    void *aux;                   // 傳給 initializer 的參數
 };
 
 /* ---------- Public API ---------- */
@@ -57,9 +64,18 @@ struct suppPage *spt_find_page (struct supplemental_page_table *, void *va);
 void   spt_remove_page (struct supplemental_page_table *, struct suppPage *);
 
 bool   vm_alloc_page (enum vm_type type, void *upage, bool writable);
+bool   vm_alloc_page_with_initializer(enum vm_type type, void *upage, bool writable,
+                                   vm_initializer init, void *aux);
 bool   vm_do_claim_page (struct suppPage *page);
+
+bool lazy_load_segment(struct suppPage *page, void *aux);
 
 void   vm_pin_page   (void *va);
 void   vm_unpin_page (void *va);
+
+void vm_pin_buffer(const void *buf, size_t size);
+void vm_unpin_buffer(const void *buf, size_t size);
+
+
 
 #endif /* VM_PAGE_H */
