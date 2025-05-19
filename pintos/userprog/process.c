@@ -43,10 +43,14 @@ process_execute(const char *file_name)
     char program_name[16];
     strlcpy(program_name, file_name, sizeof(program_name));
     char *save_ptr;
-    strtok_r(program_name, " ", &save_ptr);  // program_name 會只剩 "prog"
+    char *token = strtok_r(program_name, " ", &save_ptr);  // 只取第一個參數作為程序名稱
+    if (token == NULL) {
+        free(fn_copy);
+        return TID_ERROR;
+    }
 
     /* Create a new thread to execute FILE_NAME. */
-    tid = thread_create(program_name, PRI_DEFAULT, start_process, fn_copy);
+    tid = thread_create(token, PRI_DEFAULT, start_process, fn_copy);
     if (tid == TID_ERROR) {
         free(fn_copy);
         return TID_ERROR;
@@ -54,7 +58,10 @@ process_execute(const char *file_name)
 
     /* Semaphore: Wait for child process to finish loading. */
     sema_down(&thread_current()->sema_wait);
-    if (!thread_current()->child_loaded) return TID_ERROR;
+    if (!thread_current()->child_loaded) {
+        free(fn_copy);
+        return TID_ERROR;
+    }
 
     return tid;
 }
@@ -98,48 +105,56 @@ static void push_argument(void **esp, char *cmdline)
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void *file_name_) {
-    char *file_name = file_name_;           // file_name_ 是 malloc 出來的整行參數
-    struct intr_frame if_;
-    bool success;
+static void
+start_process (void *file_name_)
+{
+  char *file_name = file_name_;
+  struct intr_frame if_;
+  bool success;
 
-    // 1. fn_copy 給 push_argument 用
-    char *fn_copy = malloc(strlen(file_name) + 1);
-    strlcpy(fn_copy, file_name, strlen(file_name) + 1);
+  /* 初始化中斷frame */
+  memset (&if_, 0, sizeof if_);
+  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+  if_.cs = SEL_UCSEG;
+  if_.eflags = FLAG_IF | FLAG_MBS;
 
-    // 2. prog_name 給 load() 用，只拿第一個 token
-    char prog_name[128];
-    strlcpy(prog_name, file_name, sizeof(prog_name));
-    char *save_ptr;
-    strtok_r(prog_name, " ", &save_ptr);   // 只保留第一個 token，後面自動補 \0
+#ifdef VM
+  /* 創建補充頁表 */
+  thread_current()->spt = malloc(sizeof(struct supplemental_page_table));
+  if (thread_current()->spt == NULL) {
+    thread_current()->child_loaded = false;
+    sema_up(&thread_current()->parent->sema_wait);
+    thread_exit();
+  }
+  supplemental_page_table_init(thread_current()->spt);
+#endif
 
-    // 3. 初始化 interrupt frame
-    memset(&if_, 0, sizeof if_);
-    if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
-    if_.cs = SEL_UCSEG;
-    if_.eflags = FLAG_IF | FLAG_MBS;
+  /* 分配並激活頁目錄 */
+  thread_current()->pagedir = pagedir_create();
+  if (thread_current()->pagedir == NULL) {
+    thread_current()->child_loaded = false;
+    sema_up(&thread_current()->parent->sema_wait);
+    thread_exit();
+  }
+  process_activate();
 
-    // 4. load
-    success = load(prog_name, &if_.eip, &if_.esp);
-    if (success) {
-        push_argument(&if_.esp, fn_copy);  // 用完整的參數行
-        thread_current()->parent->child_loaded = true;
-        sema_up(&thread_current()->parent->sema_wait);
-    } else {
-        thread_current()->parent->child_loaded = false;
-        sema_up(&thread_current()->parent->sema_wait);
-        thread_exit();
-    }
-    free(fn_copy);
-  
-  /* Start the user process by simulating a return from an
-     interrupt, implemented by intr_exit (in
-     threads/intr-stubs.S).  Because intr_exit takes all of its
-     arguments on the stack in the form of a `struct intr_frame',
-     we just point the stack pointer (%esp) to our stack frame
-     and jump to it. */
-    asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
-    NOT_REACHED();
+  /* 載入可執行文件 */
+  success = load (file_name, &if_.eip, &if_.esp);
+
+  /* 如果載入失敗，退出 */
+  if (!success) {
+    thread_current()->child_loaded = false;
+    sema_up(&thread_current()->parent->sema_wait);
+    thread_exit();
+  }
+
+  /* 通知父線程載入成功 */
+  thread_current()->child_loaded = true;
+  sema_up(&thread_current()->parent->sema_wait);
+
+  /* 開始執行用戶程序 */
+  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+  NOT_REACHED();
 }
 
 /* Waits for thread TID to die and returns its exit status.  If
@@ -191,6 +206,15 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+#ifdef VM
+  /* 銷毀補充頁表及其所有page、frame和swap空間 */
+  if (cur->spt != NULL) {
+    supplemental_page_table_destroy(cur->spt);
+    free(cur->spt);
+    cur->spt = NULL;
+  }
+#endif
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -224,7 +248,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -307,19 +331,36 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  
+  /* 創建文件名的副本以進行解析 */
+  char *fn_copy = malloc(strlen(file_name) + 1);
+  if (fn_copy == NULL)
+    return false;
+  strlcpy(fn_copy, file_name, strlen(file_name) + 1);
+  
+  /* 解析可執行文件名 */
+  char *save_ptr;
+  char *exec_name = strtok_r(fn_copy, " ", &save_ptr);
+  if (exec_name == NULL) {
+    free(fn_copy);
+    return false;
+  }
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
-  if (t->pagedir == NULL) 
+  if (t->pagedir == NULL) {
+    free(fn_copy);
     goto done;
+  }
   process_activate ();
 
   /* Open executable file. */
   acquire_file_lock();
-  file = filesys_open (file_name);
+  file = filesys_open (exec_name);
   if (file == NULL) 
     {
-      printf ("load: %s: open failed\n", file_name);
+      printf ("load: %s: open failed\n", exec_name);
+      free(fn_copy);
       goto done; 
     }
     /* Deny write for the opened file by calling file deny write */
@@ -335,7 +376,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
       || ehdr.e_phnum > 1024) 
     {
-      printf ("load: %s: error loading executable\n", file_name);
+      printf ("load: %s: error loading executable\n", exec_name);
+      free(fn_copy);
       goto done; 
     }
 
@@ -403,6 +445,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  /* 設置命令行參數 */
+  push_argument(esp, file_name);
+  
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
@@ -411,6 +456,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
  done:
   /* We arrive here whether the load is successful or not. */
   release_file_lock();
+  free(fn_copy);
   return success;
 }
 
@@ -463,6 +509,45 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
+/* Create a minimal stack by mapping a zeroed page at the top of
+   user virtual memory. */
+static bool
+setup_stack (void **esp)
+{
+#ifdef VM
+  bool success = false;
+
+  // upage address is the first segment of stack.
+  void *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+  
+  // 在補充頁表中建立一個零頁
+  if (vm_alloc_page(VM_STACK, upage, true)) {
+    // 立即將page加載到內存中
+    struct suppPage *page = spt_find_page(thread_current()->spt, upage);
+    success = page && vm_do_claim_page(page);
+    if (success)
+      *esp = PHYS_BASE;
+  }
+  
+  return success;
+#else
+  uint8_t *kpage;
+  bool success = false;
+
+  // upage address is the first segment of stack.
+  kpage = vm_frame_allocate (PAL_USER | PAL_ZERO, PHYS_BASE - PGSIZE);
+  if (kpage != NULL)
+    {
+      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      if (success)
+        *esp = PHYS_BASE;
+      else
+        vm_frame_free (kpage);
+    }
+  return success;
+#endif
+}
+
 /* Loads a segment starting at offset OFS in FILE at address
    UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
    memory are initialized, as follows:
@@ -477,7 +562,6 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
 
    Return true if successful, false if a memory allocation error
    or disk read error occurs. */
-
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
@@ -486,48 +570,51 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
     ASSERT (pg_ofs (upage) == 0);
     ASSERT (ofs % PGSIZE == 0);
 
-    while (read_bytes > 0 || zero_bytes > 0) {
+  while (read_bytes > 0 || zero_bytes > 0) 
+    {
+      /* Calculate how to fill this page.
+         We will read PAGE_READ_BYTES bytes from FILE
+         and zero the final PAGE_ZERO_BYTES bytes. */
         size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
         size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-        // 建立 aux
-        struct file_page *aux = malloc(sizeof(struct file_page));
-        if (!aux) return false;
-        // 建議用 file_reopen
-        aux->file = file_reopen(file); // 如果沒有 file_reopen 就直接用 file
-        aux->ofs = ofs;
-        aux->read_bytes = page_read_bytes;
-        aux->zero_bytes = page_zero_bytes;
+#ifdef VM
+      // 懶加載 - 只在SUPT中註冊page
+      struct thread *curr = thread_current ();
+      ASSERT (pagedir_get_page(curr->pagedir, upage) == NULL); // 還沒有虛擬page？
 
-        if (!vm_alloc_page_with_initializer(
-                VM_FILE, upage, writable, lazy_load_segment, aux))
+      if (! vm_supt_install_filesys(curr->spt, upage,
+            file, ofs, page_read_bytes, page_zero_bytes, writable) ) {
+        return false;
+      }
+#else
+      /* Get a page of memory. */
+      uint8_t *kpage = vm_frame_allocate (PAL_USER, upage);
+      if (kpage == NULL)
             return false;
 
+      /* Load this page. */
+      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+        {
+          vm_frame_free (kpage);
+          return false;
+        }
+      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+      /* Add the page to the process's address space. */
+      if (!install_page (upage, kpage, writable))
+        {
+          vm_frame_free (kpage);
+          return false;
+        }
+#endif
+
+      /* Advance. */
         read_bytes -= page_read_bytes;
         zero_bytes -= page_zero_bytes;
         upage += PGSIZE;
         ofs += page_read_bytes;
     }
-    return true;
-}
-/* Create a minimal stack by mapping a zeroed page at the top of
-   user virtual memory. */
-static bool setup_stack(void **esp) {
-    void *stack_bottom = (void *) ((uint8_t *) PHYS_BASE - PGSIZE);
-
-    // 1. Allocate a suppPage for the stack
-    if (!vm_alloc_page(VM_STACK, stack_bottom, true))
-        return false;
-
-    // 2. Immediately claim (allocate frame and map to upage)
-    struct suppPage *page = spt_find_page(&thread_current()->spt, stack_bottom);
-    if (page == NULL)
-        return false;
-
-    if (!vm_do_claim_page(page))
-        return false;
-
-    *esp = PHYS_BASE;   // Set initial stack pointer
     return true;
 }
 

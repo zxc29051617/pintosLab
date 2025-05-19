@@ -37,6 +37,12 @@
 #include "filesys/filesys.h"
 #include "filesys/fsutil.h"
 #endif
+#ifdef VM
+#include "vm/vm.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
+#include "vm/page.h"
+#endif
 
 /* Page directory with kernel mappings only. */
 uint32_t *init_page_dir;
@@ -70,7 +76,7 @@ static void locate_block_devices (void);
 static void locate_block_device (enum block_type, const char *name);
 #endif
 
-int main (void) NO_RETURN;
+int main (void);
 
 /* Pintos main program. */
 int
@@ -98,6 +104,11 @@ main (void)
   palloc_init (user_page_limit);
   malloc_init ();
   paging_init ();
+
+#ifdef VM
+  /* Initialize Virtual memory system. (Project 3) */
+  vm_init ();
+#endif
 
   /* Segmentation. */
 #ifdef USERPROG
@@ -127,6 +138,9 @@ main (void)
   filesys_init (format_filesys);
 #endif
 
+#ifdef VM
+#endif
+
   printf ("Boot complete.\n");
   
   /* Run actions specified on kernel command line. */
@@ -135,6 +149,8 @@ main (void)
   /* Finish up. */
   shutdown ();
   thread_exit ();
+  
+  NOT_REACHED ();
 }
 
 /* Clear the "BSS", a segment that should be initialized to

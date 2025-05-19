@@ -127,7 +127,12 @@ struct thread
     struct file *exec_file;              /* The executable file this thread is running. */
     int file_fd;
     
-    struct supplemental_page_table spt;
+#ifdef VM
+    /* 虛擬記憶體支援 */
+    struct supplemental_page_table *spt;   /* 補充頁表 */
+    struct list mmap_list;                 /* struct mmap_desc 的列表 */
+    void *current_esp;                    /* 用戶程序堆棧指pin的當前值，在page錯誤可能在內核中發生時需要 */
+#endif
 
 #endif
 

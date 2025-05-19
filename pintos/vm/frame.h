@@ -5,6 +5,9 @@
 #include <list.h>
 #include <stdbool.h>
 #include "threads/palloc.h"
+#include <hash.h>
+#include "lib/kernel/hash.h"
+#include "threads/synch.h"
 
 /* Forward declarations ------------- */
 struct suppPage;
@@ -19,7 +22,7 @@ struct frame {
 };
 
 /* 初始化 → 在 vm_init() 早期呼叫 */
-void frame_table_init (void);
+void vm_frame_init (void);
 
 /* 主要介面 */
 struct frame *frame_allocate (enum palloc_flags flags);
@@ -29,4 +32,4 @@ void          frame_free     (struct frame *fr);
 void frame_pin   (struct frame *fr);
 void frame_unpin (struct frame *fr);
 
-#endif /* VM_FRAME_H */
+#endif /* vm/frame.h */

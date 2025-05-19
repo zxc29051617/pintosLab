@@ -4,16 +4,20 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
-
 #include "threads/vaddr.h"
+#include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "vm/page.h"
-#define MAX_STACK (1 << 23) // 8MB stack limit
+#include "vm/frame.h"
+
+#define MAX_STACK_SIZE 0x800000  // 8MB stack limit
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
+extern void sys_exit (int status);
 
 /* Registers handlers for interrupts that can be caused by user
    programs.
@@ -93,7 +97,7 @@ kill (struct intr_frame *f)
       printf ("%s: dying due to interrupt %#04x (%s).\n",
               thread_name (), f->vec_no, intr_name (f->vec_no));
       intr_dump_frame (f);
-      thread_exit (); 
+      sys_exit(-1); // 終止 父線程不再等待
 
     case SEL_KCSEG:
       /* Kernel's code segment, which indicates a kernel bug.
@@ -108,7 +112,7 @@ kill (struct intr_frame *f)
          kernel. */
       printf ("Interrupt %#04x (%s) in unknown segment %04x\n",
              f->vec_no, intr_name (f->vec_no), f->cs);
-      thread_exit ();
+      sys_exit(-1); // 終止 父線程不再等待
     }
 }
 
@@ -126,56 +130,116 @@ kill (struct intr_frame *f)
 static void
 page_fault (struct intr_frame *f) 
 {
-    /* 1. 取出 fault address ------------------------------------------------ */
-    void *fault_addr;
-    asm ("movl %%cr2, %0" : "=r"(fault_addr));
+  bool not_present;  /* True: not-present page, false: writing r/o page. */
+  bool write;        /* True: access was write, false: access was read. */
+  bool user;         /* True: access by user, false: access by kernel. */
+  void *fault_addr;  /* Fault address. */
 
-    intr_enable ();            /* 重新開中斷 */
-    page_fault_cnt++;
+  /* Obtain faulting address, the virtual address that was
+     accessed to cause the fault.  It may point to code or to
+     data.  It is not necessarily the address of the instruction
+     that caused the fault (that's f->eip).
+     See [IA32-v2a] "MOV-ES:--" exception "Interrupt 14--Page Fault
+     Exception (#PF)". */
+  asm ("movl %%cr2, %0" : "=r" (fault_addr));
 
-    /* 2. 解碼 error_code --------------------------------------------------- */
-    bool not_present = (f->error_code & PF_P) == 0;
-    bool write       = (f->error_code & PF_W) != 0;
-    bool user        = (f->error_code & PF_U) != 0;
-   /* ----------  Lazy-load (file / anon) 或 mmap 頁  ---------- */
-   void *upage = pg_round_down (fault_addr);
-   struct suppPage *page = spt_find_page(&thread_current()->spt, upage);
+  /* Turn interrupts back on (they were only off so that we could
+     be assured of reading CR2 before it changed). */
+  intr_enable ();
 
-   if (not_present && page != NULL) {
-    /* 這個 upage 本來就登記在 SPT，代表它要嘛還沒 load 進來，
-       要嘛被 swap out；把它 claim 回來就能解決 page fault。 */
-    if (vm_do_claim_page (page))
-        return;                 /* 處理成功，直接結束 handler */
-    /* claim 失敗就往下掉到 stack-growth 判斷／最後 kill() */
-   }
-    /* 3. ★ 嘗試做 Stack Growth ★ ------------------------------------------ */
-    if (not_present && user) {
-        void *esp   = f->esp;                 /* user-mode ESP */
-        void *upage = pg_round_down (fault_addr);
+  /* Count page faults. */
+  page_fault_cnt++;
 
-        bool within_esp = fault_addr >= esp - 32;          /* 距離 esp ≤32B */
-        bool below_phys = fault_addr < PHYS_BASE;          /* 仍在 user space */
-        bool under_cap  = PHYS_BASE - upage <= MAX_STACK;  /* 沒超 8 MB */
-        bool above_code = fault_addr >= (void *) 0x08048000;   /* ELF code 起始 */
+  /* Determine cause. */
+  not_present = (f->error_code & PF_P) == 0;
+  write = (f->error_code & PF_W) != 0;
+  user = (f->error_code & PF_U) != 0;
 
-        if (within_esp && below_phys && under_cap && above_code) {
-            /* (1) 加一條 VM_STACK 條目到 SPT ------------------------------ */
-            if (vm_alloc_page (VM_STACK, upage, /*writable=*/true)) {
-                /* (2) 立刻 claim → 配 frame、裝到 pagedir -------------- */
-                struct suppPage *sp = spt_find_page(&thread_current()->spt, upage);
-                if (sp && vm_do_claim_page (sp))
-                  return;                   /* page fault 已解決，直接回去 */
-            }
-            /* 如果 alloc/claim 失敗就往下掉到 kill() */
-        }
+  /* 核心訪問用戶地址 */
+  if (!user && is_user_vaddr(fault_addr)) {
+    /* 導致這種情況的是內核代碼嘗試訪問用戶內存，
+       但是相應的page不存在或無效。*/
+    void *esp = thread_current()->current_esp;
+    if (esp == NULL) {
+      esp = f->esp;
     }
+    
+    /* 如果這是堆疊訪問，嘗試增長堆疊 */
+    if (fault_addr >= esp - 32 && fault_addr < PHYS_BASE) {
+      /* 檢查堆疊大小限制 (8MB) */
+      if (PHYS_BASE - pg_round_down(fault_addr) <= MAX_STACK_SIZE) {
+        /* 嘗試分配新的堆疊page */
+        if (vm_alloc_page(VM_STACK, pg_round_down(fault_addr), true)) {
+          struct suppPage *page = spt_find_page(thread_current()->spt, pg_round_down(fault_addr));
+          if (page && vm_do_claim_page(page)) {
+            return; /* 成功處理page錯誤 */
+          }
+        }
+      }
+    }
+    
+    /* 如果不是堆疊訪問或堆疊增長失敗，則終止當前線程 */
+    sys_exit(-1);
+    return;
+  }
 
-    /* 4. 其他情況：照舊把行程殺掉 --------------------------------------- */
-    printf ("Page fault at %p: %s error %s page in %s context.\n",
-            fault_addr,
-            not_present ? "not present" : "rights violation",
-            write ? "writing" : "reading",
-            user ? "user" : "kernel");
-    kill (f);                                 /* ← 千萬別忘記這行 */
+  /* 檢查是否為無效訪問 */
+  if (!is_user_vaddr(fault_addr) || !not_present) {
+    sys_exit(-1);
+    return;
+  }
+
+  /* 檢查是否為堆疊訪問 */
+  bool stack_access = false;
+  void *esp = user ? f->esp : thread_current()->current_esp;
+  
+  if (esp != NULL && fault_addr >= esp - 32 && fault_addr < PHYS_BASE) {
+    stack_access = true;
+  } else if (fault_addr >= PHYS_BASE - MAX_STACK_SIZE && fault_addr < PHYS_BASE) {
+    /* 檢查是否為 PUSHA 指令 (0x60) 或其他堆疊操作 */
+    uint8_t *eip = (uint8_t *)f->eip;
+    if (user && eip && is_user_vaddr(eip) && pagedir_get_page(thread_current()->pagedir, eip)) {
+      uint8_t opcode = *eip;
+      if (opcode == 0x60 || // pusha
+          opcode == 0x50 || // push eax
+          opcode == 0x51 || // push ecx
+          opcode == 0x52 || // push edx
+          opcode == 0x53 || // push ebx
+          opcode == 0x54 || // push esp
+          opcode == 0x55 || // push ebp
+          opcode == 0x56 || // push esi
+          opcode == 0x57 || // push edi
+          opcode == 0x89 || // mov
+          opcode == 0x8b) { // mov
+        stack_access = true;
+      }
+    }
+  }
+  
+  if (stack_access) {
+    /* 檢查堆疊大小限制 (8MB) */
+    if (PHYS_BASE - pg_round_down(fault_addr) <= MAX_STACK_SIZE) {
+      /* 嘗試分配新的堆疊page */
+      if (vm_alloc_page(VM_STACK, pg_round_down(fault_addr), true)) {
+        struct suppPage *page = spt_find_page(thread_current()->spt, pg_round_down(fault_addr));
+        if (page && vm_do_claim_page(page)) {
+          return; /* 成功處理page錯誤 */
+        }
+      }
+    }
+  }
+
+  /* 嘗試從補充頁表中找到page */
+  struct suppPage *page = spt_find_page(thread_current()->spt, pg_round_down(fault_addr));
+  if (page == NULL) {
+    sys_exit(-1);
+    return;
+  }
+
+  /* 嘗試加載page */
+  if (!vm_do_claim_page(page)) {
+    sys_exit(-1);
+    return;
+  }
 }
 
